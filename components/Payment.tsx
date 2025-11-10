@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Button } from './ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 import { realtimeDb } from '@/lib/firebaseConfig';
-import { child, push, ref, update } from 'firebase/database';
+import { child, push, ref, runTransaction, update } from 'firebase/database';
 
 interface PaymentProps {
   quantity: number;
@@ -23,6 +23,8 @@ declare global {
 }
 
 const CHECKOUT_SCRIPT_URL = 'https://checkout.razorpay.com/v1/checkout.js';
+const ROW_KEYS = ['1', '2', '3', '4'];
+const ROW_CAPACITY = 5;
 
 export function Payment({ quantity, onPaymentComplete, customerEmail, customerName }: PaymentProps) {
   const [isCheckoutReady, setIsCheckoutReady] = useState(false);
@@ -101,6 +103,140 @@ export function Payment({ quantity, onPaymentComplete, customerEmail, customerNa
       const machineRef = ref(realtimeDb, machinePath);
       const logsRef = child(machineRef, 'logs');
 
+      const allocateRows = async (packets: number) => {
+        const normalizedPackets = Math.max(1, Math.min(packets, ROW_KEYS.length * ROW_CAPACITY));
+        let reservedRows: number[] = [];
+        let allocationFailed = false;
+
+        await runTransaction(machineRef, (currentMachine) => {
+          const machineState = currentMachine ? { ...currentMachine } : {};
+          const now = Date.now();
+          const orders = { ...(machineState.orders ?? {}) } as Record<string, unknown>;
+
+          const existingOrder = orders[orderId] as
+            | { row?: number; rows?: number[] }
+            | undefined;
+          if (existingOrder) {
+            if (Array.isArray(existingOrder.rows) && existingOrder.rows.length > 0) {
+              reservedRows = existingOrder.rows
+                .map((row) => Number.parseInt(String(row), 10))
+                .filter((rowNumber) => Number.isFinite(rowNumber));
+            } else if (typeof existingOrder.row === 'number' && Number.isFinite(existingOrder.row)) {
+              reservedRows = [existingOrder.row];
+            }
+            return machineState;
+          }
+
+          const rowWorkingState: Record<string, { remaining: number; dispensedCount: number; lastUpdated?: number }> =
+            {};
+
+          ROW_KEYS.forEach((key) => {
+            const state = (machineState.rows as Record<string, unknown> | undefined)?.[key] as
+              | { remaining?: number; dispensedCount?: number; lastUpdated?: number }
+              | undefined;
+            rowWorkingState[key] = {
+              remaining:
+                typeof state?.remaining === 'number' && Number.isFinite(state.remaining)
+                  ? state.remaining
+                  : ROW_CAPACITY,
+              dispensedCount:
+                typeof state?.dispensedCount === 'number' && Number.isFinite(state.dispensedCount)
+                  ? state.dispensedCount
+                  : 0,
+              lastUpdated: typeof state?.lastUpdated === 'number' ? state.lastUpdated : undefined,
+            };
+          });
+
+          const startRowValue = ROW_KEYS.includes(String(machineState.nextRow))
+            ? String(machineState.nextRow)
+            : ROW_KEYS[0];
+
+          let pointerIndex = ROW_KEYS.indexOf(startRowValue);
+          if (pointerIndex < 0) {
+            pointerIndex = 0;
+          }
+
+          const allocations: string[] = [];
+
+          for (let i = 0; i < normalizedPackets; i += 1) {
+            let foundRow: string | null = null;
+
+            for (let attempt = 0; attempt < ROW_KEYS.length; attempt += 1) {
+              const rowKey = ROW_KEYS[(pointerIndex + attempt) % ROW_KEYS.length];
+              const state = rowWorkingState[rowKey];
+
+              if (state.remaining > 0) {
+                foundRow = rowKey;
+                state.remaining -= 1;
+                state.dispensedCount += 1;
+                state.lastUpdated = now;
+                pointerIndex = (ROW_KEYS.indexOf(rowKey) + 1) % ROW_KEYS.length;
+                break;
+              }
+            }
+
+            if (!foundRow) {
+              allocationFailed = true;
+              break;
+            }
+
+            allocations.push(foundRow);
+          }
+
+          if (allocationFailed || allocations.length !== normalizedPackets) {
+            return currentMachine ?? null;
+          }
+
+          reservedRows = allocations.map((rowKey) => Number.parseInt(rowKey, 10));
+
+          const baseRows = (machineState.rows as Record<string, unknown> | undefined) ?? {};
+          const updatedRows: Record<string, unknown> = { ...baseRows };
+          allocations.forEach((rowKey) => {
+            const state = rowWorkingState[rowKey];
+            updatedRows[rowKey] = {
+              ...(updatedRows[rowKey] as Record<string, unknown> | undefined),
+              remaining: state.remaining,
+              dispensedCount: state.dispensedCount,
+              lastUpdated: state.lastUpdated,
+            };
+          });
+
+          ROW_KEYS.forEach((rowKey) => {
+            if (!updatedRows[rowKey]) {
+              const state = rowWorkingState[rowKey];
+              updatedRows[rowKey] = {
+                remaining: state.remaining,
+                dispensedCount: state.dispensedCount,
+                lastUpdated: state.lastUpdated,
+              };
+            }
+          });
+
+          const baseOrders = (machineState.orders as Record<string, unknown> | undefined) ?? {};
+          const updatedOrders: Record<string, unknown> = { ...baseOrders };
+          updatedOrders[orderId] = {
+            row: reservedRows[0],
+            rows: reservedRows,
+            quantity: normalizedPackets,
+            paid: true,
+            dispensed: false,
+            createdAt: now,
+          };
+
+          machineState.rows = updatedRows;
+          machineState.orders = updatedOrders;
+          machineState.nextRow = Number.parseInt(ROW_KEYS[pointerIndex], 10) || Number.parseInt(ROW_KEYS[0], 10) || 1;
+
+          return machineState;
+        });
+
+        if (reservedRows.length !== normalizedPackets) {
+          throw new Error('All rows are empty. Please contact support.');
+        }
+
+        return reservedRows;
+      };
+
       void update(machineRef, {
         payment_id: orderId,
         dispense: false,
@@ -136,26 +272,67 @@ export function Payment({ quantity, onPaymentComplete, customerEmail, customerNa
         theme: {
           color: '#0f172a',
         },
-        handler: () => {
-          update(machineRef, {
-            dispense: true,
-            status: 'payment_success',
-            updated_at: Date.now(),
-          }).catch((firebaseError) => {
-            console.error('Failed to update success state in Realtime Database', firebaseError);
-          });
+        handler: async () => {
+          try {
+            const reservedRows = await allocateRows(quantity);
+            const now = Date.now();
 
-          push(logsRef, {
-            type: 'payment_success',
-            payment_id: orderId,
-            amount: total,
-            quantity,
-            timestamp: Date.now(),
-          }).catch((firebaseError) => {
-            console.error('Failed to append success log entry', firebaseError);
-          });
+            update(machineRef, {
+              dispense: true,
+              status: 'payment_success',
+              updated_at: now,
+              assigned_rows: reservedRows,
+              last_order_quantity: quantity,
+              last_error: null,
+            }).catch((firebaseError) => {
+              console.error('Failed to update success state in Realtime Database', firebaseError);
+            });
 
-          onPaymentComplete(orderId);
+            push(logsRef, {
+              type: 'payment_success',
+              payment_id: orderId,
+              amount: total,
+              quantity,
+              rows: reservedRows,
+              timestamp: now,
+            }).catch((firebaseError) => {
+              console.error('Failed to append success log entry', firebaseError);
+            });
+
+            onPaymentComplete(orderId);
+          } catch (reservationError) {
+            const message =
+              reservationError instanceof Error
+                ? reservationError.message
+                : 'Unable to reserve stock. Please contact support.';
+
+            setErrorMessage(message);
+
+            const now = Date.now();
+
+            update(machineRef, {
+              status: 'out_of_stock',
+              dispense: false,
+              updated_at: now,
+              last_error: message,
+              assigned_rows: null,
+            }).catch((firebaseError) => {
+              console.error('Failed to update out-of-stock status', firebaseError);
+            });
+
+            push(logsRef, {
+              type: 'order_reservation_failed',
+              payment_id: orderId,
+              amount: total,
+              quantity,
+              timestamp: now,
+              reason: message,
+            }).catch((firebaseError) => {
+              console.error('Failed to append reservation failure log entry', firebaseError);
+            });
+
+            onPaymentComplete(orderId);
+          }
         },
       });
 
